@@ -1,0 +1,89 @@
+name: Deploy OpenSEO to Cloudflare
+
+# One-click Cloudflare self-host deploy from the browser (Actions tab -> Run
+# workflow), instead of running `pnpm deploy:selfhost` on a local machine.
+#
+# Required repo secrets:
+#   CLOUDFLARE_API_TOKEN  - Workers Scripts, Workers KV Storage, D1, Workers R2
+#                           Storage, Secrets Store, Access: Apps and Policies,
+#                           and Access: Organizations (all Edit), plus Account
+#                           Settings Read.
+#   CLOUDFLARE_ACCOUNT_ID - the account to deploy into.
+# Optional repo secret:
+#   DATAFORSEO_API_KEY    - SEO data features stay disabled until it is set.
+on:
+  workflow_dispatch:
+    inputs:
+      allowed_emails:
+        description: "Emails allowed to log in (comma-separated)"
+        required: true
+
+permissions:
+  contents: read
+
+# Never cancel a deployment while migrations or resource updates are running.
+concurrency:
+  group: deploy-selfhost
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check secrets
+        shell: bash
+        run: |
+          failed=0
+          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing repo secret: $name (Settings -> Secrets and variables -> Actions)"
+              failed=1
+            elif [[ "${!name}" =~ [[:space:]] ]]; then
+              echo "::error::$name contains a space or line break; re-enter it"
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+      # No-op once the repo already treats the DataForSEO key as optional.
+      - name: Allow deploying without a DataForSEO key
+        run: |
+          sed -i 's/DATAFORSEO_API_KEY: Config.redacted("DATAFORSEO_API_KEY"),/DATAFORSEO_API_KEY: optionalSecret("DATAFORSEO_API_KEY"),/' deploy/alchemy/alchemy.run.ts
+          sed -i '/^if (!env.DATAFORSEO_API_KEY) {$/,/^}$/d' scripts/selfhost-deploy-preflight.mjs
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Adopts the existing state-store worker on later runs.
+      - name: Set up deploy state storage
+        run: pnpm alchemy cloudflare bootstrap
+
+      - name: Write deploy settings
+        env:
+          ALLOWED_EMAILS: ${{ inputs.allowed_emails }}
+          DATAFORSEO_API_KEY: ${{ secrets.DATAFORSEO_API_KEY }}
+        run: |
+          printf 'ACCESS_ALLOWED_EMAILS=%s\nDATAFORSEO_API_KEY=%s\n' \
+            "$ALLOWED_EMAILS" "$DATAFORSEO_API_KEY" > .env.selfhost
+
+      - name: Deploy
+        run: pnpm deploy:selfhost --yes
